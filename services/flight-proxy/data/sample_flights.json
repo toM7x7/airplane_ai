@@ -1,0 +1,34 @@
+{
+  "source": "mock",
+  "generatedAt": "2025-01-01T00:00:00Z",
+  "flights": [
+    {
+      "id": "JAL001",
+      "callsign": "JAL001",
+      "lat": 35.5494,
+      "lon": 139.7798,
+      "alt": 11500,
+      "speed": 240,
+      "heading": 90
+    },
+    {
+      "id": "ANA102",
+      "callsign": "ANA102",
+      "lat": 35.7647,
+      "lon": 140.3864,
+      "alt": 9000,
+      "speed": 220,
+      "heading": 245
+    },
+    {
+      "id": "SKY777",
+      "callsign": "SKY777",
+      "lat": 34.6937,
+      "lon": 135.5022,
+      "alt": 10500,
+      "speed": 230,
+      "heading": 12
+    }
+  ]
+}
+
