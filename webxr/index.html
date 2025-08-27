@@ -1,0 +1,319 @@
+<!doctype html><meta charset="utf-8"/>
+<title>Flight Peek (Local)</title>
+<style>body{font:16px system-ui;margin:16px}input{width:120px}</style>
+<h1>Flight Peek (Local)</h1>
+<p>
+  Lat <input id="lat" value="35.5494"/>
+  Lon <input id="lon" value="139.7798"/>
+  <button id="search">Search Flights</button>
+  <button id="play">Play TTS</button>
+  <small style="margin-left:8px;color:#666">PCでも動作（ARはWebXR対応環境/拡張が必要）</small>
+  
+</p>
+<pre id="out">Ready.</pre>
+<hr/>
+<button id="enterAR">Enter AR (if supported)</button>
+<button id="exitAR" disabled>Exit AR</button>
+<div id="hud" style="position:fixed;left:12px;bottom:12px;color:white;background:rgba(0,0,0,.35);padding:8px 10px;border-radius:8px;display:none;max-width:80vw"></div>
+<canvas id="xr-canvas" style="position:fixed;inset:0;width:100vw;height:100vh;display:none;touch-action:none"></canvas>
+<script type="module">
+import { CONFIG } from './config.js';
+
+const out = document.getElementById('out');
+const $ = (s)=>document.querySelector(s);
+
+function formatFlight(p, lat, lon){
+  const dist = (Math.hypot(p.lat-lat,p.lon-lon)*111).toFixed(1); // rough km
+  const alt = (p.geo_alt ?? p.baro_alt ?? 0);
+  const callsign = p.callsign || p.icao24 || 'N/A';
+  return `${callsign}  ${dist} km  hdg ${p.hdg ?? '-'}°  alt ${alt ?? '-'} m`;
+}
+
+$('#search').onclick = async () => {
+  const lat = Number($('#lat').value), lon = Number($('#lon').value);
+  const url = `${CONFIG.FLIGHT_ENDPOINT}/nearby?lat=${lat}&lon=${lon}&radius_km=150`;
+  try {
+    const r = await fetch(url); if (!r.ok) throw new Error(`${r.status}`);
+    const j = await r.json();
+    j.states.sort((a,b)=>{
+      const d=(p)=>Math.hypot(p.lat-lat,p.lon-lon); return d(a)-d(b);
+    });
+    const top = j.states.slice(0,5).map(p=>`- ${formatFlight(p,lat,lon)}`).join('\n');
+    const nearest = j.states[0];
+    out.textContent = `Flights: ${j.states.length}\nNearest: ${nearest? formatFlight(nearest,lat,lon) : 'N/A'}\n\nTop 5:\n${top || '(none)'}`;
+  } catch (e) {
+    out.textContent = `Fetch failed: ${e}`;
+  }
+};
+
+$('#play').onclick = async () => {
+  const text = 'こちらは飛行機解説テスト音声です';
+  try {
+    const r = await fetch(`${CONFIG.TTS_ENDPOINT}/tts`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    if (!r.ok) throw new Error(`${r.status}`);
+    const buf = await r.arrayBuffer();
+    const blob = new Blob([buf],{type:'audio/mpeg'});
+    new Audio(URL.createObjectURL(blob)).play();
+  } catch (e) {
+    // Fallback: Web Speech API (no network, browser-provided)
+    if ('speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP';
+      speechSynthesis.speak(u);
+      out.textContent = 'TTS endpoint unavailable. Spoke via Web Speech.';
+    } else {
+      out.textContent = `TTS failed: ${e}`;
+    }
+  }
+};
+
+// --- WebXR (Quest 3で有効化 / PCはエミュレータで確認) ---
+const btnEnter = document.getElementById('enterAR');
+const btnExit = document.getElementById('exitAR');
+const canvas = document.getElementById('xr-canvas');
+const hud = document.getElementById('hud');
+let xrSession = null, gl = null, refSpace = null, flightTimer = null;
+
+// Minimal mat4 helpers for rigid transforms
+const M = {
+  identity(){ return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; },
+  // Column-major multiply (OpenGL-style): r = a * b
+  multiply(a,b){
+    const r=new Array(16);
+    for(let i=0;i<4;i++){
+      for(let j=0;j<4;j++){
+        r[j*4+i] = a[0*4+i]*b[j*4+0] + a[1*4+i]*b[j*4+1] + a[2*4+i]*b[j*4+2] + a[3*4+i]*b[j*4+3];
+      }
+    }
+    return r;
+  },
+  translate(m,[x,y,z]){
+    const t=[1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1];
+    return M.multiply(m,t);
+  },
+  scale(m,[x,y,z]){
+    const s=[x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1];
+    return M.multiply(m,s);
+  },
+  rotateY(m,rad){
+    const c=Math.cos(rad), s=Math.sin(rad);
+    const Ry=[c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1];
+    return M.multiply(m,Ry);
+  }
+};
+
+// Simple quad shader (color uniform)
+let prog=null, aPos=0, uMVP=null, uColor=null, quadBuf=null, fsqBuf=null;
+function initGL(){
+  const vsSrc=`attribute vec3 a; uniform mat4 u; void main(){ gl_Position=u*vec4(a,1.0); }`;
+  const fsSrc=`precision mediump float; uniform vec4 c; void main(){ gl_FragColor=c; }`;
+  function sh(t,s){ const o=gl.createShader(t); gl.shaderSource(o,s); gl.compileShader(o); if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
+  const vs=sh(gl.VERTEX_SHADER,vsSrc), fs=sh(gl.FRAGMENT_SHADER,fsSrc);
+  prog=gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs); gl.bindAttribLocation(prog,0,'a'); gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+  aPos=0; uMVP=gl.getUniformLocation(prog,'u'); uColor=gl.getUniformLocation(prog,'c');
+  quadBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+  // unit quad centered at origin (two triangles via TRIANGLE_STRIP)
+  const s=1; const v=new Float32Array([ -s,-s,0,  s,-s,0, -s, s,0,  s, s,0 ]);
+  gl.bufferData(gl.ARRAY_BUFFER,v,gl.STATIC_DRAW);
+  // full-screen triangle in clip space
+  fsqBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,fsqBuf);
+  const fv=new Float32Array([ -1,-1,0,  3,-1,0,  -1,3,0 ]);
+  gl.bufferData(gl.ARRAY_BUFFER,fv,gl.STATIC_DRAW);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.disable(gl.CULL_FACE);
+}
+
+function drawQuad(mvp,color){
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uMVP,false,new Float32Array(mvp));
+  gl.uniform4fv(uColor,new Float32Array(color));
+  gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
+
+function drawScreenOverlay(color){
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uMVP,false,new Float32Array(M.identity()));
+  gl.uniform4fv(uColor,new Float32Array(color));
+  gl.bindBuffer(gl.ARRAY_BUFFER,fsqBuf);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.disable(gl.DEPTH_TEST);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.enable(gl.DEPTH_TEST);
+}
+
+// Haversine for distance (km)
+function haversine(lat1,lon1,lat2,lon2){
+  const R=6371e3, rad=x=>x*Math.PI/180; const dlat=rad(lat2-lat1), dlon=rad(lon2-lon1);
+  const a=Math.sin(dlat/2)**2+Math.cos(rad(lat1))*Math.cos(rad(lat2))*Math.sin(dlon/2)**2; return (2*R*Math.asin(Math.sqrt(a)))/1000;
+}
+
+function bearingDeg(lat1,lon1,lat2,lon2){
+  const toRad = x=>x*Math.PI/180, toDeg=x=>x*180/Math.PI;
+  const φ1=toRad(lat1), φ2=toRad(lat2), Δλ=toRad(lon2-lon1);
+  const y=Math.sin(Δλ)*Math.cos(φ2);
+  const x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  let θ=toDeg(Math.atan2(y,x));
+  if (θ<0) θ+=360; return θ; // 0..360 from North
+}
+const wrap180 = d => ((d+540)%360)-180;
+const toDeg = r => r*180/Math.PI, toRad = d => d*Math.PI/180;
+function yawFromQuat(q){
+  // yaw around Y (OpenXR coordinate, assuming y-up)
+  const {x,y,z,w} = q;
+  const siny_cosp = 2*(w*y + x*z);
+  const cosy_cosp = 1 - 2*(y*y + z*z);
+  return Math.atan2(siny_cosp, cosy_cosp); // radians
+}
+
+async function fetchNearest(lat,lon){
+  const url = `${CONFIG.FLIGHT_ENDPOINT}/nearby?lat=${lat}&lon=${lon}&radius_km=150`;
+  const r = await fetch(url); if (!r.ok) throw new Error(`${r.status}`);
+  const j = await r.json();
+  j.states.sort((a,b)=>{
+    const d=(p)=>Math.hypot(p.lat-lat,p.lon-lon); return d(a)-d(b);
+  });
+  const n=j.states[0];
+  const distKm=n? haversine(lat,lon,n.lat,n.lon).toFixed(1):null;
+  return {nearest:n, count:j.states.length, distKm};
+}
+
+if (navigator.xr?.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+    btnEnter.disabled = !supported; btnEnter.textContent = supported? 'Enter AR' : 'AR not supported';
+  });
+}
+
+btnEnter.onclick = async () => {
+  if (!navigator.xr) return alert('WebXR not available.');
+  try {
+    xrSession = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local'],
+      optionalFeatures: ['dom-overlay'],
+      domOverlay: { root: document.body }
+    });
+  } catch (e) { return alert('Failed to start AR: ' + e); }
+
+  canvas.style.display = 'block'; hud.style.display='block';
+  gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true, antialias:true, premultipliedAlpha:true });
+  await gl.makeXRCompatible?.();
+  xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl, { alpha:true }) });
+  refSpace = await xrSession.requestReferenceSpace('local');
+  initGL();
+
+  // Acquire location and fetch nearest flight once (UIは後回しなので最小仕様)
+  let lat = Number(document.getElementById('lat').value);
+  let lon = Number(document.getElementById('lon').value);
+  try {
+    await new Promise((res,rej)=>navigator.geolocation?.getCurrentPosition(p=>{lat=p.coords.latitude;lon=p.coords.longitude;res();},()=>res(),{timeout:1500})||res());
+  } catch {}
+  let flightInfo = null;
+  try {
+    flightInfo = await fetchNearest(lat,lon);
+    const n = flightInfo.nearest;
+    let extra = '';
+    try { const pos = await new Promise(res=>navigator.geolocation?.getCurrentPosition(res, ()=>res({coords:{}}), {timeout:800}));
+      if (pos?.coords?.heading!=null && n) {
+        const b = bearingDeg(pos.coords.latitude, pos.coords.longitude, n.lat, n.lon);
+        const delta = Math.round(wrap180(b - pos.coords.heading));
+        extra = `  turn ${Math.abs(delta)}° ${delta>=0?'right':'left'}`;
+      }
+    } catch {}
+    hud.textContent = n? `Nearest ${n.callsign||n.icao24||'N/A'}  ${flightInfo.distKm} km  hdg ${n.hdg??'?-'}°  alt ${n.geo_alt??n.baro_alt??'-'} m${extra}` : 'No flights in range';
+  } catch (e) { hud.textContent = 'Flight fetch failed: ' + e; }
+
+  // Periodic refresh while in AR
+  flightTimer && clearInterval(flightTimer);
+  flightTimer = setInterval(async ()=>{
+    try {
+      const fi = await fetchNearest(lat,lon);
+      const n = fi.nearest;
+      let extra = '';
+      try { const pos = await new Promise(res=>navigator.geolocation?.getCurrentPosition(res, ()=>res({coords:{}}), {timeout:800}));
+        if (pos?.coords?.heading!=null && n) {
+          const b = bearingDeg(pos.coords.latitude, pos.coords.longitude, n.lat, n.lon);
+          const delta = Math.round(wrap180(b - pos.coords.heading));
+          extra = `  turn ${Math.abs(delta)}° ${delta>=0?'right':'left'}`;
+        }
+      } catch {}
+      hud.textContent = n? `Nearest ${n.callsign||n.icao24||'N/A'}  ${fi.distKm} km  hdg ${n.hdg??'?-'}°  alt ${n.geo_alt??n.baro_alt??'-'} m${extra}` : 'No flights in range';
+    } catch {}
+  }, 15000);
+
+  xrSession.addEventListener('end', () => {
+    canvas.style.display = 'none'; hud.style.display='none';
+    btnExit.disabled = true; btnEnter.disabled = false;
+    if (flightTimer) { clearInterval(flightTimer); flightTimer=null; }
+  });
+  btnExit.disabled = false; btnEnter.disabled = true;
+
+  const onXRFrame = (t, frame) => {
+    xrSession.requestAnimationFrame(onXRFrame);
+    const pose = frame.getViewerPose(refSpace);
+    if (!pose) return;
+    const layer = xrSession.renderState.baseLayer;
+    // Ensure canvas matches framebuffer size
+    const w = layer.framebufferWidth, h = layer.framebufferHeight;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+    gl.clearDepth(1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // Visible overlay to verify rendering
+    drawScreenOverlay([0.0, 0.0, 0.0, 0.1]);
+
+    for (const view of pose.views) {
+      const vp = layer.getViewport(view);
+      gl.viewport(vp.x, vp.y, vp.width, vp.height);
+      const proj = Array.from(view.projectionMatrix);
+      const viewMat = Array.from(view.transform.inverse.matrix);
+      const viewWorld = Array.from(view.transform.matrix);
+
+      // Reticle 1m ahead, small (camera-locked)
+      let model = M.identity();
+      model = M.translate(model,[0,-0.2,-1.0]);
+      model = M.scale(model,[0.05,0.05,1]);
+      let modelWorld = M.multiply(viewWorld, model);
+      let mvp = M.multiply(proj, M.multiply(viewMat, modelWorld));
+      drawQuad(mvp,[0.2,0.9,0.2,0.8]); // reticle
+
+      // Directional info panel: rotate around Y by bearing - headYaw
+      if (flightInfo?.nearest) {
+        const n = flightInfo.nearest;
+        const q = view.transform.orientation; // DOMPointReadOnly
+        const headYaw = toDeg(yawFromQuat(q));
+        const b = bearingDeg(lat,lon,n.lat,n.lon);
+        const delta = wrap180(b - headYaw);
+
+        let modelDir = M.identity();
+        modelDir = M.rotateY(modelDir, toRad(delta));
+        modelDir = M.translate(modelDir,[0,0.0,-2.0]);
+        modelDir = M.scale(modelDir,[0.35,0.2,1]);
+        const modelDirWorld = M.multiply(viewWorld, modelDir);
+        const mvpDir = M.multiply(proj, M.multiply(viewMat, modelDirWorld));
+        drawQuad(mvpDir,[0.0,0.6,1.0,0.35]); // bearing-aligned panel
+      } else {
+        // Fallback fixed panel
+        model = M.identity();
+        model = M.translate(model,[0,0.0,-2.0]);
+        model = M.scale(model,[0.35,0.2,1]);
+        modelWorld = M.multiply(viewWorld, model);
+        mvp = M.multiply(proj, M.multiply(viewMat, modelWorld));
+        drawQuad(mvp,[0.0,0.5,1.0,0.25]);
+      }
+    }
+  };
+  xrSession.requestAnimationFrame(onXRFrame);
+};
+
+btnExit.onclick = () => { xrSession?.end(); };
+</script>

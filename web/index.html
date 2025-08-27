@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AIキャラ × 飛行機トラッキング (PoC)</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #0b0e13; color: #e5e7eb; font-family: system-ui, sans-serif; }
+      #app { width: 100%; height: 100%; overflow: hidden; }
+      .banner { position: absolute; top: 8px; left: 8px; font-size: 12px; opacity: .8; }
+      .corner { position: absolute; bottom: 8px; right: 8px; font-size: 12px; opacity: .75; }
+      a { color: #93c5fd; }
+      #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(17,24,39,.65); padding: 10px 12px; border-radius: 6px; font-size: 14px; display: none; }
+      #chat { position: absolute; bottom: 8px; left: 8px; width: 320px; background: rgba(2,6,23,.6); padding: 8px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      #chat textarea { width: 100%; height: 60px; background: #0b1220; color: #e5e7eb; border: 1px solid #1f2937; border-radius: 4px; padding: 6px; resize: vertical; }
+      #chat button { margin-top: 6px; }
+      #list { position: absolute; top: 56px; right: 8px; width: 300px; max-height: 55vh; overflow: auto; background: rgba(2,6,23,.6); padding: 8px; border-radius: 6px; }
+      .item { display: flex; justify-content: space-between; align-items: center; padding: 6px; border: 1px solid #1f2937; border-radius: 4px; margin-bottom: 6px; cursor: pointer; }
+      .item:hover { background: rgba(148,163,184,.15); }
+      .item.selected { outline: 2px solid #f59e0b; }
+      .item .meta { font-size: 11px; opacity: .8; }
+      #hud { position: absolute; top: 56px; left: 8px; transform: none; background: rgba(17,24,39,.7); padding: 6px 8px; border-radius: 6px; font-size: 12px; min-width: 280px; text-align: left; display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div class="banner">
+      WebXR/Three.js デモ（デスクトップはフォールバック）
+      <span style="margin-left:8px;">中心(lat,lon):
+        <input id="lat" type="number" step="0.0001" style="width:90px;" placeholder="35.68" />
+        <input id="lon" type="number" step="0.0001" style="width:90px;" placeholder="139.76" />
+        <button id="setCenter">設定</button>
+        <button id="myLoc">現在地</button>
+        <span style="margin-left:6px;">半径km:
+          <input id="radius" type="number" step="1" style="width:70px;" placeholder="30" />
+        </span>
+        <button id="fetchNow">取得</button>
+        <button id="toggleFlights">表示切替</button>
+        <button id="clearSel">非選択</button>
+      </span>
+    </div>
+    <div id="loading">読み込み中...</div>
+    <div class="corner">
+      <button id="speakBtn">フライト読み上げ</button>
+      <a href="../AGENTS.md" target="_blank" rel="noreferrer" style="margin-left:8px;">AGENTS.md</a>
+    </div>
+    <div id="chat">
+      <div style="font-weight:bold; margin-bottom:4px;">CLI風AI対話（試作メモ）</div>
+      <div id="chatLog" style="height: 120px; overflow:auto; background:#0b1220; border:1px solid #1f2937; border-radius:4px; padding:6px; margin-bottom:6px;"></div>
+      <textarea id="prompt" placeholder="> 見ている機体について教えて"></textarea>
+      <div>
+        <button id="sendPrompt">送信</button>
+        <span style="opacity:.7; margin-left:6px;">演出: ドット絵口パク/タイプライター/SEは別途実装</span>
+      </div>
+    </div>
+    <div id="list">
+      <div style="font-weight:bold; margin-bottom:6px;">フライト一覧</div>
+      <div id="flightList"></div>
+    </div>
+    <div id="hud"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+  </html>
